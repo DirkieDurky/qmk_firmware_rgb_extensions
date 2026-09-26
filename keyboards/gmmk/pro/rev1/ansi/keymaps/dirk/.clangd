@@ -1,0 +1,22 @@
+# `rgb_matrix_user.inc` is an include fragment, not a standalone translation
+# unit: quantum/rgb_matrix/rgb_matrix.c #include's it at rgb_matrix.c:57.
+# Force-include a shim that reproduces the macro environment it sees there, so
+# RGB_MATRIX_EFFECT() expands to nothing and RGB_MATRIX_CUSTOM_EFFECT_IMPLS is
+# defined. Without this the body greys out as an inactive #ifdef branch and
+# every type resolves to undeclared. Path is relative to the compile command's
+# working directory, which is the repo root.
+#
+# CompileFlags.Add replaces (not appends to) the root .clangd's Add list, so the
+# root's entries are repeated here to keep them in effect for *.inc files.
+CompileFlags:
+  Add:
+    - -include
+    - keyboards/gmmk/pro/rev1/ansi/keymaps/dirk/rgb_matrix_user_shim.h
+    - -Wno-unknown-attributes
+    - -Wno-maybe-uninitialized
+    - -Wno-unknown-warning-option
+    - -Wno-pointer-to-int-cast
+    - -Wno-int-to-void-pointer-cast
+    - -DPROGMEM=
+
+InlayHints: { Designators: false }
