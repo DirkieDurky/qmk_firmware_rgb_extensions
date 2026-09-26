@@ -22,6 +22,12 @@
 // it is also the only feedback there is, because the round has not ended and the
 // sweep has nothing to say.
 //
+// A mistake also ends with a number on the board: after SIMON_SAYS_PRINT_DELAY_MS
+// the length of the sequence you just lost is printed on the number row, scrolling,
+// which is the same no-font trick calculator.h prints its answers with. It is
+// inside the new game pause, so it lands on a board that is otherwise dark and
+// costs the round nothing.
+//
 // The four keys of the right hand column are the score. They are not letters, so
 // nothing in the game can ever light one, which is what makes them safe to give
 // over to the answer: a completed round sweeps them green from the bottom up and a
@@ -63,6 +69,14 @@ static const uint8_t simon_says_letters[SIMON_SAYS_LETTERS] = {
 #endif
 STATIC_ASSERT(SIMON_SAYS_SEQUENCE_MAX >= 1, "the game needs room for at least one key");
 STATIC_ASSERT(SIMON_SAYS_SEQUENCE_MAX <= UINT8_MAX, "a step is a uint8_t index into simon_says_letters");
+
+// The key that shows each digit, indexed by the digit itself rather than by its
+// character, so a score is a lookup and not a switch. 0 first because it is the one
+// digit that is not next in reading order on the keycaps.
+static const uint8_t simon_says_digits[10] = {
+    K_0, K_1, K_2, K_3, K_4, K_5, K_6, K_7, K_8, K_9,
+};
+STATIC_ASSERT(sizeof(simon_says_digits) / sizeof(simon_says_digits[0]) == 10, "a uint8_t score can be any of the ten digits");
 
 // ---------------------------------------------------------------------------
 // Timing
@@ -108,6 +122,28 @@ STATIC_ASSERT(SIMON_SAYS_SWEEP_STEP_MS > 0, "the sweep has to move");
 #ifndef SIMON_SAYS_ROUND_COOLDOWN_MS
 #    define SIMON_SAYS_ROUND_COOLDOWN_MS 2000
 #endif
+
+// How long after a mistake the score is printed, counted from the keystroke. It
+// sits inside SIMON_SAYS_NEW_GAME_COOLDOWN_MS, which is what the delay is for: the
+// red sweep is well over by the time the number appears, so the two read as "you
+// lost" and then "here is how far you got" rather than as one long noise. Raise the
+// cooldown if you set this above it - the print then lands during the next round
+// and takes the board over while you are trying to play it.
+//
+// 0 prints on the same frame as the mistake.
+#ifndef SIMON_SAYS_PRINT_DELAY_MS
+#    define SIMON_SAYS_PRINT_DELAY_MS 2500
+#endif
+
+// The score is printed on the number row, the keys the digits are actually on, and
+// scrolls left to right. Three slots because simon_says_length is a uint8_t, so
+// three digits is the most it can ever need. There is no font involved anywhere in
+// this - it is the same trick calculator.h uses to print its answers, right down to
+// the shared rgb_print() that draws it.
+#define SIMON_SAYS_PRINT_DIGITS 3
+#define SIMON_SAYS_PRINT_KEY_MS 4096 // how long a digit is lit, in rgb_print() ticks
+#define SIMON_SAYS_PRINT_GAP_MS 2048 // and the dark part of its slot after that
+STATIC_ASSERT(SIMON_SAYS_PRINT_KEY_MS > 0, "a printed digit has to be lit for something");
 
 // ---------------------------------------------------------------------------
 // The score column
@@ -219,6 +255,21 @@ static uint32_t simon_says_age[RGB_MATRIX_LED_COUNT];
 static uint32_t simon_says_verdict_at[RGB_MATRIX_LED_COUNT];
 static bool     simon_says_verdict_good[RGB_MATRIX_LED_COUNT]; // only read where the stamp is live
 
+// The score waiting to be printed, and the score being printed.
+//
+// Two flags rather than one because there are two things going on: a mistake arms
+// the print to happen SIMON_SAYS_PRINT_DELAY_MS later, and then the print itself
+// runs for a good few hundred milliseconds after that. Folding them together would
+// mean either re-arming forever or losing the delay.
+//
+// The stamp is a start rather than a deadline, compared by unsigned subtraction like
+// every other timestamp in this file, so it survives the 32 bit wrap.
+static int      simon_says_print_buffer[SIMON_SAYS_PRINT_DIGITS]; // LED indices, most significant digit first
+static uint8_t  simon_says_print_count   = 0;
+static bool     simon_says_print_queued  = false;
+static bool     simon_says_print_running = false;
+static uint32_t simon_says_print_started = 0;
+
 // timer_read32() for the frame being rendered, and the fade window read from the
 // speed slider for it. Read once a frame for the same reason as simon_says_age[],
 // and because the knob can move under us mid-frame: the renderer and the sweep
@@ -279,6 +330,32 @@ static void simon_says_judge_led(uint8_t letter, bool good) {
     simon_says_verdict(simon_says_letters[letter], good);
 }
 
+// Arm the score to be printed, this many milliseconds from now.
+//
+// Most significant digit first, because that is the only order a number reads in.
+// A one digit score is one digit: the divisor walk below is what drops the leading
+// zeroes a fixed width buffer would otherwise print, and a score of 0 still prints
+// its one digit rather than nothing.
+static void simon_says_arm_print(uint8_t score) {
+    // The largest power of ten that divides into score, so 7 gives 1 and 64 gives
+    // 10. score is a uint8_t, so divisor tops out at 100 and the multiply below
+    // cannot overflow an int.
+    uint8_t divisor = 1;
+    while (score / (divisor * 10) != 0) {
+        divisor *= 10;
+    }
+
+    uint8_t count = 0;
+    while (divisor != 0 && count < SIMON_SAYS_PRINT_DIGITS) {
+        simon_says_print_buffer[count++] = simon_says_digits[(score / divisor) % 10];
+        divisor /= 10;
+    }
+
+    simon_says_print_count   = count;
+    simon_says_print_started = simon_says_now;
+    simon_says_print_queued  = true;
+}
+
 // Deal a fresh game: one random letter, no progress, and no round under way - the
 // caller then chooses the phase, which is the only difference between selecting the
 // effect and fumbling a key. Deliberately leaves any sweep and any verdicts already
@@ -313,10 +390,19 @@ static void simon_says_answer(uint8_t letter) {
         // board before the pause is up but is not part of a round yet, so a key
         // pressed during the pause is not judged against it, and the pause survives
         // however hard the wrong key is mashed.
+        //
+        // The score is read before the deal, not after: simon_says_deal() resets the
+        // length to one, so afterwards there would be nothing left to print but a 1.
+        // What is printed is the length of the sequence just lost, i.e. the round you
+        // were on - not how far into it you got, which is simon_says_typed, and is
+        // the other number you might have wanted here.
+        uint8_t lost = simon_says_length - 1;
+
         simon_says_sweep         = SIMON_SAYS_SWEEP_BAD;
         simon_says_sweep_started = simon_says_now;
         simon_says_deal();
         simon_says_judge_led(letter, false);
+        simon_says_arm_print(lost);
         simon_says_pause         = SIMON_SAYS_NEW_GAME_COOLDOWN_MS;
         simon_says_paused        = true;
         simon_says_pause_started = simon_says_now;
@@ -453,11 +539,31 @@ static void simon_says_step_pause(void) {
     }
 }
 
+// Start the score print once the delay after the mistake is up. Like the pause, one
+// of the things here that draws nothing: the drawing is rgb_print()'s job, called
+// per chunk from simon_says() below.
+//
+// printTick is the shared counter from helpers/rgb_print.h, and it is shared with
+// calculator.h and dirc.h as well as with anything else that has printed since the
+// keyboard booted. Only one effect runs at a time so nothing can be reading it, but
+// its value is not ours to inherit, hence the reset: without it a print starts part
+// way through its own digit slots and shows nothing.
+static void simon_says_step_print(void) {
+    if (!simon_says_print_queued) return;
+
+    if (simon_says_now - simon_says_print_started < SIMON_SAYS_PRINT_DELAY_MS) return;
+
+    simon_says_print_queued  = false;
+    simon_says_print_running = true;
+    printTick                = 0;
+}
+
 // Declared here rather than only in the order they are defined below, because
-// simon_says_step() calls all four and reads best sitting next to the renderer
+// simon_says_step() calls all of them and reads best sitting next to the renderer
 // that consumes what they fill in.
 static void simon_says_step_input(void);
 static void simon_says_step_pause(void);
+static void simon_says_step_print(void);
 static void simon_says_step_show(void);
 static void simon_says_step_sweep(void);
 
@@ -495,6 +601,14 @@ static void simon_says_step(bool init) {
             simon_says_verdict_at[i] = SIMON_SAYS_NO_TIME;
         }
 
+        // A print left running by whatever ran before is dropped rather than
+        // adopted: its buffer is ours and its digits mean nothing to this game, and
+        // rgb_print() cannot be told to stop early other than by being asked again
+        // until it says it is done.
+        simon_says_print_queued  = false;
+        simon_says_print_running = false;
+        simon_says_print_count   = 0;
+
         // The shared generator behind random8_max() starts every boot from the
         // same fixed seed, so without this the game would open on the same letter
         // every time. This is the entropy hook it provides for exactly that.
@@ -512,6 +626,12 @@ static void simon_says_step(bool init) {
     // frame by the judgement above, still gets a whole frame of replay started and
     // stepped rather than none at all.
     simon_says_step_pause();
+
+    // After the input, so that a print delay of 0 armed by the judgement above still
+    // starts its print on that same frame. The print is independent of the pause -
+    // the two lengths are separate settings - so this is only about not making a
+    // zero delay mean "next frame".
+    simon_says_step_print();
 
     if (simon_says_showing) {
         simon_says_step_show();
@@ -557,7 +677,13 @@ static void simon_says_step_input(void) {
     // changed. The pause counts for the same reason and more strongly - the next
     // sequence is already dealt, so mashing through it would otherwise be answered
     // against a round the player has not been shown.
-    if (simon_says_showing || simon_says_paused || pressed == SIMON_SAYS_NO_LETTER) return;
+    //
+    // A print running counts too, and would not otherwise: normally a print lands
+    // well inside the new game pause and never gets this far, but the print delay
+    // and the pause are independent settings, and a score scrolling across the board
+    // with a keypress being judged underneath it is a keypress answered against a
+    // sequence nobody can see.
+    if (simon_says_showing || simon_says_paused || simon_says_print_running || pressed == SIMON_SAYS_NO_LETTER) return;
 
     simon_says_answer(pressed);
 }
@@ -657,6 +783,18 @@ static bool simon_says(effect_params_t *params) {
         // once held_keys_step() has run.
         held_keys_step(params->init, held_keys_switch_down);
         simon_says_step(params->init);
+    }
+
+    // A print owns the whole strip, the same way calculator.h hands its answer the
+    // whole strip, and for the same reason: a score is a thing you read, and it
+    // cannot be read from a board that is also replaying a sequence or sweeping a
+    // verdict. rgb_print() draws one chunk's worth per call and says when it is
+    // done, which is what retires the print here.
+    if (simon_says_print_running) {
+        if (rgb_print(led_min, led_max, simon_says_print_buffer, simon_says_print_count, SIMON_SAYS_PRINT_KEY_MS, SIMON_SAYS_PRINT_GAP_MS, 0, simon_says_print_count)) {
+            simon_says_print_running = false;
+        }
+        return rgb_matrix_check_finished_leds(led_max);
     }
 
     for (uint8_t i = led_min; i < led_max; i++) {
