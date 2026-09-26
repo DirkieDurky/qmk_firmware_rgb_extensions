@@ -1,6 +1,7 @@
 #include "helpers/keycodes.h"
 #include "helpers/rgb_print.h"
 #include "helpers/map_colors.h"
+#include "helpers/reactive_fade.h"
 
 static int parseDigit(int keyCode) {
     switch (keyCode) {
@@ -119,9 +120,9 @@ static bool calculator(effect_params_t *params) {
         return rgb_matrix_check_finished_leds(led_max);
     }
 
-    uint16_t max_tick = 65535 / rgb_matrix_config.speed;
+    uint16_t window = reactive_fade_window(rgb_matrix_config.speed, REACTIVE_FADE_MIN_MS, REACTIVE_FADE_MAX_MS);
     for (uint8_t i = led_min; i < led_max; i++) {
-        uint16_t tick  = max_tick;
+        uint16_t tick  = window;
         int      index = -1;
         // Reverse search to find most recent key hit
         for (int8_t j = g_last_hit_tracker.count - 1; j >= 0; j--) {
@@ -184,7 +185,7 @@ static bool calculator(effect_params_t *params) {
 
         HSV color = map_colors(i);
 
-        uint16_t offset = scale16by8(tick, rgb_matrix_config.speed);
+        uint16_t offset = reactive_fade_offset(tick, window);
         HSV      hsv    = SOLID_REACTIVE_SIMPLE_math(color, offset);
         RGB      rgb    = hsv_to_rgb(hsv);
         rgb_matrix_set_color(i, rgb.r, rgb.g, rgb.b);

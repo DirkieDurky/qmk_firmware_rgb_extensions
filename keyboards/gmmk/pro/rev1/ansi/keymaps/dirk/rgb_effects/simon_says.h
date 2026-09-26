@@ -1,7 +1,7 @@
 #pragma once
 
 #include "matrix.h"
-#include "helpers/solid_reactive_simple_custom_base.h"
+#include "helpers/solid_reactive_simple_custom_base.h"   // which pulls in reactive_fade.h
 
 // Presses are read straight from the matrix rather than from
 // g_last_hit_tracker, because that tracker can never hold a sequence. It keeps
@@ -11,9 +11,9 @@
 // there is no way to notice that anything happened at all.
 #define SIMON_SAYS_HITS 32
 
-// How long the keyboard must sit idle before it replays what you typed. The fade
-// below only lasts SIMON_SAYS_FADE_MS, so triggering on that would fire in the
-// middle of ordinary typing and then throw the recording away on the next
+// How long the keyboard must sit idle before it replays what you typed. A fade
+// only lasts at most SIMON_SAYS_FADE_MAX_MS, so triggering on that would fire in
+// the middle of ordinary typing and then throw the recording away on the next
 // keystroke. Two seconds of silence is unambiguously "the user stopped", which
 // leaves room for a whole phrase.
 #ifndef SIMON_SAYS_IDLE_MS
@@ -29,31 +29,41 @@
 #    define SIMON_SAYS_LOOP_DELAY_MS SIMON_SAYS_IDLE_MS
 #endif
 
+// Bounds for the fade window, chosen separately from the shared
+// REACTIVE_FADE_*_MS defaults because the slowest fade here has to finish before
+// the replay starts, or a key you pressed last would still be dimming when the
+// performance began. Tying the ceiling to the idle threshold keeps that true
+// whatever you set SIMON_SAYS_IDLE_MS to.
+#ifndef SIMON_SAYS_FADE_MIN_MS
+#    define SIMON_SAYS_FADE_MIN_MS 100
+#endif
+#ifndef SIMON_SAYS_FADE_MAX_MS
+#    define SIMON_SAYS_FADE_MAX_MS (SIMON_SAYS_IDLE_MS / 2)
+#endif
+STATIC_ASSERT(SIMON_SAYS_FADE_MIN_MS > 0 && SIMON_SAYS_FADE_MAX_MS > SIMON_SAYS_FADE_MIN_MS, "SIMON_SAYS_FADE_MAX_MS must exceed SIMON_SAYS_FADE_MIN_MS");
+
 static uint32_t simon_says_hit_time[SIMON_SAYS_HITS];
 static uint8_t  simon_says_hit_led[SIMON_SAYS_HITS];
 static uint8_t  simon_says_keys[MATRIX_ROWS][MATRIX_COLS]; // key states of the previous frame
 
 static uint8_t  simon_says_hit_count = 0;     // presses currently in the recording
 static uint16_t simon_says_age[RGB_MATRIX_LED_COUNT]; // ms since each LED was lit, UINT16_MAX = never
+static uint16_t simon_says_fade     = SIMON_SAYS_FADE_MIN_MS; // ms for a key to dim to black
 static uint32_t simon_says_now     = 0;        // timer_read32() for the frame being rendered
 static uint32_t simon_says_next    = 0;        // earliest time the next replay may start
 static uint32_t simon_says_started = 0;        // when the current replay began
 static bool     simon_says_playing = false;    // true while replaying
 
-// How long a key stays visible after it was hit, and the point at which nothing
-// is lit any more. Same formula as solid_reactive_simple_custom_base, so the
-// live view fades exactly like that effect does.
-static uint16_t simon_says_fade_ms(void) {
-    if (rgb_matrix_config.speed == 0) return UINT16_MAX;
-    return 65535 / rgb_matrix_config.speed;
-}
-
 static void simon_says_paint(uint8_t led, uint32_t age) {
-    uint16_t fade   = simon_says_fade_ms();
-    uint16_t tick   = (age > fade) ? fade : (uint16_t)age;
-    uint16_t offset = scale16by8(tick, rgb_matrix_config.speed);
+    // A key older than the window is black, which is the common case here, and
+    // SOLID_REACTIVE_SIMPLE_math(hsv, 255) would produce (0,0,0) too - so this is
+    // exact, and it keeps the work below off the hot path.
+    if (age >= simon_says_fade) {
+        rgb_matrix_set_color(led, 0, 0, 0);
+        return;
+    }
 
-    HSV hsv = SOLID_REACTIVE_SIMPLE_math(map_colors(led), offset);
+    HSV hsv = SOLID_REACTIVE_SIMPLE_math(map_colors(led), reactive_fade_offset(age, simon_says_fade));
     RGB rgb = hsv_to_rgb(hsv);
     rgb_matrix_set_color(led, rgb.r, rgb.g, rgb.b);
 }
@@ -115,7 +125,10 @@ static void simon_says_step(bool init) {
     if (init) simon_says_forget();
     simon_says_scan_keys(init);
 
-    uint16_t fade = simon_says_fade_ms();
+    // Read once a frame: the speed can change under us mid-frame, and the
+    // renderer and the loop bookkeeping below must agree on the window.
+    uint16_t fade = reactive_fade_window(rgb_matrix_config.speed, SIMON_SAYS_FADE_MIN_MS, SIMON_SAYS_FADE_MAX_MS);
+    simon_says_fade = fade;
 
     // The replay is over once every recorded key has been shown and the last one
     // has faded out. Looping keeps the keyboard performing the last sequence
