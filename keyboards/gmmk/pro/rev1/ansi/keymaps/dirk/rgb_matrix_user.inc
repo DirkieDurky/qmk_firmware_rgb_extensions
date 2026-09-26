@@ -6,6 +6,7 @@ RGB_MATRIX_EFFECT(calculator)
 RGB_MATRIX_EFFECT(echo)
 RGB_MATRIX_EFFECT(held_keys)
 RGB_MATRIX_EFFECT(held_keys_fade_out)
+RGB_MATRIX_EFFECT(simon_says)
 
 #ifdef RGB_MATRIX_CUSTOM_EFFECT_IMPLS
 
@@ -15,5 +16,6 @@ RGB_MATRIX_EFFECT(held_keys_fade_out)
 #include "rgb_effects/calculator.h"
 #include "rgb_effects/echo.h"
 #include "rgb_effects/helpers/held_keys.h"
+#include "rgb_effects/simon_says.h"
 
 #endif
