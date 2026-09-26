@@ -54,6 +54,13 @@ static uint32_t simon_says_next    = 0;        // earliest time the next replay 
 static uint32_t simon_says_started = 0;        // when the current replay began
 static bool     simon_says_playing = false;    // true while replaying
 
+// True while the buffer holds a phrase the user is still typing, so the next
+// keystroke extends it. Without this the other two states are indistinguishable:
+// a non-empty buffer that is not currently playing is either a half-typed
+// phrase (append) or a finished performance waiting out its dark gap before the
+// next repeat (discard), and there is no other bit that tells them apart.
+static bool     simon_says_typing  = false;
+
 static void simon_says_paint(uint8_t led, uint32_t age) {
     // A key older than the window is black, which is the common case here, and
     // SOLID_REACTIVE_SIMPLE_math(hsv, 255) would produce (0,0,0) too - so this is
@@ -80,12 +87,14 @@ static void simon_says_record(uint8_t led, uint32_t time) {
     simon_says_hit_time[simon_says_hit_count] = time;
     simon_says_hit_count++;
 
+    simon_says_typing  = true;                  // user input, not a finished performance
     simon_says_next    = time + SIMON_SAYS_IDLE_MS;
 }
 
 static void simon_says_forget(void) {
     simon_says_hit_count = 0;
     simon_says_playing   = false;
+    simon_says_typing    = false;
     simon_says_next      = simon_says_now + SIMON_SAYS_IDLE_MS;
 }
 
@@ -109,9 +118,13 @@ static void simon_says_scan_keys(bool init) {
             uint8_t led_count = rgb_matrix_map_row_column_to_led(row, col, led);
             if (led_count == 0) continue;
 
-            // The user is typing: a running replay is abandoned and the sequence
-            // is recorded again from this keystroke on.
-            if (simon_says_playing) simon_says_forget();
+            // Any keystroke that is not continuing a phrase the user is still
+            // typing starts a fresh recording, discarding whatever was in the
+            // buffer. That has to cover the dark gap between two repeats and
+            // not just a replay in progress: the buffer is still full then, so
+            // keying during the gap appended to the finished sequence and the
+            // new phrase was played back as its tail.
+            if (!simon_says_typing) simon_says_forget();
             for (uint8_t i = 0; i < led_count; i++) {
                 simon_says_record(led[i], simon_says_now);
             }
@@ -148,6 +161,9 @@ static void simon_says_step(bool init) {
     if (!simon_says_playing && simon_says_hit_count > 0 && (int32_t)(simon_says_now - simon_says_next) >= 0) {
         simon_says_playing = true;
         simon_says_started = simon_says_next;
+        // From here on the buffer is a performance being replayed, not a phrase
+        // being typed, so a keystroke now has to start over rather than append.
+        simon_says_typing  = false;
     }
 
     // Age of each LED, built once per frame and then reused by the render passes.
