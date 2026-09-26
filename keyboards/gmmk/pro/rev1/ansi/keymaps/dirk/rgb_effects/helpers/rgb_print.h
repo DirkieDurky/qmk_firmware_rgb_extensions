@@ -2,6 +2,7 @@
 
 long printTick = 0;
 
+// Returns true when done, false when it needs to be called again next frame to continue
 static bool rgb_print(uint8_t led_min, uint8_t led_max, int keyCodes[], int count, int keyLength, int intervalLength, int loopLength, int totalLength) {
     // Simple way to prevent the same output from appearing multiple times
     if (totalLength == 1) totalLength = 2;
