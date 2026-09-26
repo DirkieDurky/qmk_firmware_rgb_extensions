@@ -16,9 +16,11 @@
 //
 // The key you pressed is lit as it is judged, green if it was the next one of the
 // sequence and red if it was not, fading out on the same shared curve as the sweep.
-// That is the only per key feedback the game gives, and it is what tells you how
-// you are doing through the long middle of a sequence, where the sweep has nothing
-// to say because the round has not ended.
+// Each key keeps its own verdict on its own clock, so getting a run of them right
+// leaves a trail of greens behind it instead of only the newest one. That is the
+// only per key feedback the game gives, and through the long middle of a sequence
+// it is also the only feedback there is, because the round has not ended and the
+// sweep has nothing to say.
 //
 // The four keys of the right hand column are the score. They are not letters, so
 // nothing in the game can ever light one, which is what makes them safe to give
@@ -37,6 +39,7 @@
 
 #include "helpers/keycodes.h"
 #include "helpers/map_colors.h"
+#include "helpers/rgb_print.h"
 #include "helpers/held_keys.h" // which pulls in reactive_fade.h
 
 // ---------------------------------------------------------------------------
@@ -97,24 +100,13 @@ STATIC_ASSERT(SIMON_SAYS_FADE_MIN_MS > 0 && SIMON_SAYS_FADE_MAX_MS > SIMON_SAYS_
 STATIC_ASSERT(SIMON_SAYS_FADE_MAX_MS <= UINT16_MAX, "the fade window is a uint16_t");
 STATIC_ASSERT(SIMON_SAYS_SWEEP_STEP_MS > 0, "the sweep has to move");
 
-// The pause between one round and the next. Two of them, one for each way a round
-// can end, so a good round can linger and a bad one can be made to feel it.
-//
-// Both are counted from the keystroke that ended the round, both draw a black
-// letter field while they run, and both refuse to judge a key, so mashing through
-// one neither skips it nor changes it. The sweep of the round just finished runs
-// inside the pause, so if you want that answer to finish before the next sequence
-// starts, a pause wants to be at least
-// (SIMON_SAYS_PROGRESS_STEPS - 1) * SIMON_SAYS_SWEEP_STEP_MS + SIMON_SAYS_FADE_MAX_MS,
-// which is how long a sweep can last at the slowest setting of the speed slider.
-// That is why both default to 1500. Set either to 0 to begin the next round on
-// the very same frame as the judgement, and set one below the sweep above to let
-// the two overlap.
+// The pause between one game and the next (after making a mistake)
 #ifndef SIMON_SAYS_NEW_GAME_COOLDOWN_MS
 #    define SIMON_SAYS_NEW_GAME_COOLDOWN_MS 10000
 #endif
+// The pause between one round and the next.
 #ifndef SIMON_SAYS_ROUND_COOLDOWN_MS
-#    define SIMON_SAYS_ROUND_COOLDOWN_MS 2000 // a completed round gets this to be sat with
+#    define SIMON_SAYS_ROUND_COOLDOWN_MS 2000
 #endif
 
 // ---------------------------------------------------------------------------
@@ -139,12 +131,11 @@ STATIC_ASSERT(sizeof(simon_says_progress_keys) / sizeof(simon_says_progress_keys
 // ---------------------------------------------------------------------------
 
 // Sentinels for the "nothing here" values below, which have to be values no real
-// entry can take: a 32 bit age in milliseconds, a position in simon_says_letters,
-// and an LED index.
+// entry can take: a 32 bit age in milliseconds, a 32 bit timer stamp, and a position
+// in simon_says_letters.
 #define SIMON_SAYS_AGE_OFF UINT32_MAX // this LED has nothing on it
+#define SIMON_SAYS_NO_TIME UINT32_MAX // this LED has not been judged yet
 #define SIMON_SAYS_NO_LETTER UINT8_MAX
-#define SIMON_SAYS_NO_LED UINT8_MAX // no key has been judged yet
-STATIC_ASSERT(RGB_MATRIX_LED_COUNT < SIMON_SAYS_NO_LED, "SIMON_SAYS_NO_LED is compared against every LED, so no LED may be able to take its value");
 
 // Which way the score column is sweeping, if at all. 0 doubles as "no sweep", so
 // a freshly selected effect cannot inherit one.
@@ -207,18 +198,26 @@ static uint8_t simon_says_shadow[SIMON_SAYS_LETTERS];
 // chunks the state of the scan before that.
 static uint32_t simon_says_age[RGB_MATRIX_LED_COUNT];
 
-// The key the player pressed last, whether it was the next one of the sequence, and
-// when it was pressed. One key rather than an array because a judgement is the last
-// thing that happened and the last thing that happened is all there is to show: a
-// second keypress overwrites it.
+// When each LED was last judged, and whether that judgement was right.
 //
-// Deliberately not in simon_says_age[], which is cleared and rebuilt every frame.
-// The verdict has to outlive the frame it was made on - it is often the only thing
-// on the board for the whole of a long sequence - so it is stamped and left to the
-// renderer to age, the way the sweep is.
-static uint8_t  simon_says_verdict_led     = SIMON_SAYS_NO_LED;
-static bool     simon_says_verdict_good    = false;
-static uint32_t simon_says_verdict_started = 0;
+// Per LED, not one slot for "the key you pressed last". A player working through a
+// long sequence has several keys lit at once - three greens in a row, or two greens
+// and then the red that ended the round - and each has to keep its own colour for
+// its own fade. A single slot is exactly what stops that happening: the next
+// judgement overwrites the last, so the key pressed a moment ago drops out of green
+// and back to whatever the rest of the effect makes of it.
+//
+// Stamped and left to the renderer to age rather than kept in simon_says_age[],
+// which is cleared and rebuilt every frame, because a verdict has to outlive the
+// frame it was made on - mid sequence it is often the only thing on the board for
+// whole seconds at a time.
+//
+// SIMON_SAYS_NO_TIME until an LED is first judged, which is deliberately not zero:
+// a stamp of zero reads as "judged at boot", and a fade window longer than the time
+// the effect has been selected for would then light every key on the board. Set by
+// the clear in the init branch of simon_says_step().
+static uint32_t simon_says_verdict_at[RGB_MATRIX_LED_COUNT];
+static bool     simon_says_verdict_good[RGB_MATRIX_LED_COUNT]; // only read where the stamp is live
 
 // timer_read32() for the frame being rendered, and the fade window read from the
 // speed slider for it. Read once a frame for the same reason as simon_says_age[],
@@ -259,26 +258,37 @@ static HSV simon_says_sweep_hsv(void) {
     return simon_says_verdict_hsv(simon_says_sweep == SIMON_SAYS_SWEEP_GOOD);
 }
 
-// Light this key with the answer to the keypress that just happened, and start its
-// fade. Called on both sides of a judgement, so the two cannot disagree about which
-// of them is right.
+// Light this LED with the answer to the keypress that just happened, and start its
+// fade.
+//
+// Touches only the one LED, so the verdicts already on the board are left to finish
+// their own fades - which is the whole point of them being per LED. Re-judging a
+// key restarts its fade rather than adding to it, so holding a key down and tapping
+// it again does not stack up brightness.
+//
+// Takes an LED rather than a position in simon_says_letters so that it can also
+// serve the restart key, which is not a letter.
+static void simon_says_verdict(uint8_t led, bool good) {
+    simon_says_verdict_at[led]   = simon_says_now;
+    simon_says_verdict_good[led] = good;
+}
+
+// The same, for a key of the sequence. Called on both sides of a judgement, so the
+// two cannot disagree about which of them is right.
 static void simon_says_judge_led(uint8_t letter, bool good) {
-    simon_says_verdict_led     = simon_says_letters[letter];
-    simon_says_verdict_good    = good;
-    simon_says_verdict_started = simon_says_now;
+    simon_says_verdict(simon_says_letters[letter], good);
 }
 
 // Deal a fresh game: one random letter, no progress, and no round under way - the
 // caller then chooses the phase, which is the only difference between selecting the
-// effect and fumbling a key. Deliberately leaves any sweep alone, see the call in
-// simon_says_step().
+// effect and fumbling a key. Deliberately leaves any sweep and any verdicts already
+// on the board alone, see the call in simon_says_step().
 static void simon_says_deal(void) {
     simon_says_length      = 1;
     simon_says_sequence[0] = simon_says_random();
     simon_says_typed       = 0;
     simon_says_showing     = false;
     simon_says_paused      = false;
-    simon_says_verdict_led = SIMON_SAYS_NO_LED;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,14 +480,20 @@ static void simon_says_step(bool init) {
     }
 
     if (init) {
-        // The first frame after this effect is selected. Drop any sweep left over
-        // from whatever ran before, and deal a new game. It goes straight into the
-        // replay, no penalty, because there is nothing to be punished for yet - and
-        // starting in the replay is what makes the key readings below safe to seed
-        // the press shadow with instead of being judged as presses: a letter already
-        // under your finger when you switch over is not a press, and one you press in
-        // the same frame is not either.
+        // The first frame after this effect is selected. Drop a sweep and any
+        // verdicts left over from whatever ran before, and deal a new game. It goes
+        // straight into the replay, no penalty, because there is nothing to be
+        // punished for yet - and starting in the replay is what makes the key
+        // readings below safe to seed the press shadow with instead of being judged
+        // as presses: a letter already under your finger when you switch over is not
+        // a press, and one you press in the same frame is not either.
         simon_says_sweep = SIMON_SAYS_SWEEP_NONE;
+
+        // Only here, and only ever here: a verdict is meant to survive the rest of
+        // the round, so a mistake must not clear them. See simon_says_verdict_at[].
+        for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+            simon_says_verdict_at[i] = SIMON_SAYS_NO_TIME;
+        }
 
         // The shared generator behind random8_max() starts every boot from the
         // same fixed seed, so without this the game would open on the same letter
@@ -524,9 +540,7 @@ static void simon_says_step_input(void) {
         simon_says_paused        = true;
         simon_says_pause_started = simon_says_now;
 
-        simon_says_verdict_led     = K_ENTER;
-        simon_says_verdict_good    = true;
-        simon_says_verdict_started = simon_says_now;
+        simon_says_verdict(K_ENTER, true);
         return;
     }
 
@@ -571,10 +585,15 @@ static void simon_says_paint(uint8_t led) {
         return;
     }
 
-    // Then the key the player pressed last, green or red, fading out on the same
-    // shared curve as the sweep - so the speed slider moves it like it moves
-    // everything else, and it is one knob for the whole effect rather than a
-    // duration of its own that nothing else would answer to.
+    // Then any key that has been judged and whose fade has not run out, green or
+    // red as it was judged, fading out on the same shared curve as the sweep - so
+    // the speed slider moves it like it moves everything else, and it is one knob
+    // for the whole effect rather than a duration of its own that nothing else
+    // would answer to.
+    //
+    // Several of these can be lit at once, each on its own clock, which is the
+    // point of keeping them per LED: a sequence entered quickly leaves a trail of
+    // greens behind it rather than only the newest one.
     //
     // Ahead of the replay and of the pause because a judgement is newer than
     // either: a key just found right stays green even though the sequence it
@@ -582,13 +601,12 @@ static void simon_says_paint(uint8_t led) {
     // wrong stays red for the whole of the pause that follows rather than being
     // swallowed by the black of it.
     //
-    // Only the one LED matches, and only while its fade is still running; after
-    // that it falls through to whoever owns the key now, which for a key still
-    // under your finger is the held key feedback.
-    if (led == simon_says_verdict_led) {
-        uint32_t age = simon_says_now - simon_says_verdict_started;
+    // An LED with no live verdict falls through to whoever owns the key now, which
+    // for a key still under your finger is the held key feedback.
+    if (simon_says_verdict_at[led] != SIMON_SAYS_NO_TIME) {
+        uint32_t age = simon_says_now - simon_says_verdict_at[led];
         if (reactive_fade_offset(age, simon_says_fade) != 255) {
-            HSV hsv = simon_says_verdict_hsv(simon_says_verdict_good);
+            HSV hsv = simon_says_verdict_hsv(simon_says_verdict_good[led]);
             RGB rgb = hsv_to_rgb(SOLID_REACTIVE_SIMPLE_math(hsv, reactive_fade_offset(age, simon_says_fade)));
             rgb_matrix_set_color(led, rgb.r, rgb.g, rgb.b);
             return;
